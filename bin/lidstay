@@ -1,0 +1,148 @@
+#!/bin/bash
+# Compatible with the Bash 3.2 shipped with macOS.
+set -u
+VERSION=0.1.0
+state_dir="${HOME}/Library/Application Support/lidstay"
+lock="$state_dir/session"
+lid=0
+seconds=0
+child=''
+keeper=''
+auth_keeper=''
+owned=0
+previous=''
+usage() {
+  cat <<'HELP'
+Usage: lidstay [--lid] [--for DURATION] [-- COMMAND [ARG...]]
+       lidstay status | restore | --help | --version
+
+Keep macOS awake until Ctrl-C, a timer expires, or a command exits.
+  --lid           Also prevent lid-close sleep (administrator access required).
+  --for DURATION  End after a positive integer followed by s, m, or h.
+                  Cannot be combined with a command.
+  -- COMMAND      Run a command as your current user; preserve its exit status.
+  status          Show the system sleep setting and session state.
+  restore         Recover a stale lid session, restoring its saved setting.
+
+Without --lid, uses caffeinate and leaves lid-close behavior unchanged.
+HELP
+}
+fail() { printf 'lidstay: %s\n' "$*" >&2; exit 1; }
+read_sleep() { pmset -g | awk '$1 == "SleepDisabled" { print $2; exit }'; }
+read_pid() { cat "$lock/pid" 2>/dev/null || true; }
+live_owner() {
+  local pid
+  pid=$(read_pid)
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  kill -0 "$pid" 2>/dev/null
+}
+cleanup() {
+  local result=$?
+  trap - EXIT INT TERM HUP
+  if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; fi
+  if [ -n "$keeper" ]; then kill "$keeper" 2>/dev/null || true; wait "$keeper" 2>/dev/null || true; fi
+  if [ -n "$auth_keeper" ]; then kill "$auth_keeper" 2>/dev/null || true; wait "$auth_keeper" 2>/dev/null || true; fi
+  if [ "$owned" = 1 ]; then
+    if ! sudo -n pmset -a disablesleep "$previous"; then
+      printf '\nlidstay: could not restore sleep. Run: lidstay restore\n' >&2
+      exit 1
+    fi
+    rm -f "$lock/pid" "$lock/previous"
+    rmdir "$lock"
+  fi
+  exit "$result"
+}
+[ "$(uname -s)" = Darwin ] || fail 'macOS is required.'
+case "${1:-}" in
+  --help|-h) usage; exit 0;;
+  --version) printf '%s\n' "$VERSION"; exit 0;;
+  status)
+    [ "$#" = 1 ] || fail 'status takes no arguments.'
+    printf 'System sleep disabled: %s\n' "$(read_sleep)"
+    if [ -d "$lock" ]; then
+      if live_owner; then printf 'Lid session: active (PID %s)\n' "$(read_pid)"; else printf 'Lid session: interrupted; run lidstay restore\n'; fi
+    else printf 'Lid session: none\n'; fi
+    exit 0;;
+  restore)
+    [ "$#" = 1 ] || fail 'restore takes no arguments.'
+    [ -d "$lock" ] || fail 'No saved session. To explicitly enable system sleep, run: sudo pmset -a disablesleep 0'
+    live_owner && fail 'A session is running. Stop it before restoring.'
+    previous=$(cat "$lock/previous" 2>/dev/null) || fail 'Missing recovery state. Inspect the session directory before changing sleep settings.'
+    case "$previous" in 0|1) ;; *) fail 'Invalid recovery state.';; esac
+    sudo pmset -a disablesleep "$previous" || fail 'Could not restore sleep.'
+    rm -f "$lock/pid" "$lock/previous"
+    rmdir "$lock" || fail 'Could not remove recovery directory.'
+    printf 'Restored SleepDisabled=%s.\n' "$previous"
+    exit 0;;
+esac
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --lid) lid=1; shift;;
+    --for)
+      [ "$#" -ge 2 ] || fail '--for needs a duration, such as 30m.'
+      duration=$2
+      case "$duration" in *s) factor=1;; *m) factor=60;; *h) factor=3600;; *) fail 'Use a duration such as 30s, 30m, or 2h.';; esac
+      amount=${duration%?}
+      case "$amount" in ''|*[!0-9]*|0*) fail 'Duration must be a positive integer without leading zeros.';; esac
+      [ "${#amount}" -le 6 ] || fail 'Duration is too large.'
+      seconds=$((amount * factor))
+      [ "$seconds" -le 604800 ] || fail 'Maximum duration is seven days.'
+      shift 2;;
+    --) shift; [ "$#" -gt 0 ] || fail 'Expected a command after --.'; break;;
+    *) fail "Unknown option: $1. Use -- before a command.";;
+  esac
+done
+[ "$seconds" = 0 ] || [ "$#" = 0 ] || fail '--for and a command cannot be combined.'
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+if [ "$lid" = 1 ]; then
+  umask 077
+  mkdir -p "$state_dir" || fail 'Cannot create state directory.'
+  chmod 700 "$state_dir" || fail 'Cannot secure state directory.'
+  # Authenticate before acquiring the lock; no privileged command execution.
+  sudo -v || fail 'Administrator access is required for --lid.'
+  mkdir "$lock" 2>/dev/null || fail 'A lid session or recovery state exists. Run lidstay status.'
+  previous=$(read_sleep)
+  case "$previous" in 0|1) ;; *) rmdir "$lock"; fail 'Cannot read SleepDisabled; no setting changed.';; esac
+  printf '%s\n' "$previous" > "$lock/previous" || fail 'Cannot save recovery state.'
+  printf '%s\n' "$$" > "$lock/pid" || fail 'Cannot save session PID.'
+  owned=1
+  sudo -n pmset -a disablesleep 1 || fail 'Cannot disable sleep.'
+  (
+    tick=''
+    trap '[ -z "$tick" ] || kill "$tick" 2>/dev/null; exit 0' TERM INT HUP
+    while :; do
+      sleep 60 & tick=$!
+      wait "$tick" || exit
+      sudo -n -v || exit
+    done
+  ) >/dev/null 2>&1 &
+  auth_keeper=$!
+  printf 'Lid sleep disabled. Keep your Mac ventilated. Previous setting: %s.\n' "$previous" >&2
+fi
+# -w ensures this assertion ends even if this process is killed unexpectedly.
+caffeinate -i -w "$$" >/dev/null 2>&1 &
+keeper=$!
+printf 'Awake session started. Ctrl-C to stop.\n' >&2
+if [ "$#" -gt 0 ]; then
+  # Preserve stdin for interactive commands such as Codex and Claude Code.
+  exec 3<&0
+  "$@" <&3 &
+  exec 3<&-
+  child=$!
+  wait "$child"
+  result=$?
+  child=''
+  exit "$result"
+elif [ "$seconds" -gt 0 ]; then
+  sleep "$seconds" &
+  child=$!
+  wait "$child"
+  result=$?
+  child=''
+  exit "$result"
+else
+  wait "$keeper"
+fi
